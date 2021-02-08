@@ -11,7 +11,7 @@ class FNNModel(nn.Module):
         self.embedding_size = embedding_size
         self.window_size = window_size
         self.hidden_size = hidden_size
-        #self.drop = nn.Dropout(dropout)
+        self.drop = nn.Dropout(dropout)
         self.encoder = nn.Embedding(self.ntoken, self.embedding_size)
         self.Middle = nn.Linear(self.window_size * self.embedding_size, self.hidden_size)
         self.act = torch.tanh
@@ -22,7 +22,7 @@ class FNNModel(nn.Module):
         if tie_weights:
             if self.embedding_size != self.hidden_size:
                 raise ValueError('When using the tied flag, hidden_size must be equal to embedding_size')
-            self.decoder.weight = self.encoder.weight
+            self.decoder1.weight = self.encoder.weight
         self.init_weights()
 
     def init_weights(self):
@@ -32,6 +32,10 @@ class FNNModel(nn.Module):
         #nn.init.xavier_uniform_(self.decoder2.weight)
         nn.init.xavier_uniform_(self.Middle.weight)
 
+    def getembedding(self,input):
+        emb = self.encoder(input)
+        return emb
+
     def forward(self, input):
         #emb = self.drop(self.encoder(input))
         #print(input.shape)
@@ -39,7 +43,7 @@ class FNNModel(nn.Module):
         #emb = emb.view(-1, self.window_size * self.embedding_size)
         output = self.act(self.Middle(emb))
         #print(output.shape)
-        #output = self.drop(output)
+        output = self.drop(output)
         decoded_1 = self.decoder1(output)
         #print(decoded_1.shape)
         #decoded_2 = self.decoder2(emb)
