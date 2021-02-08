@@ -3,12 +3,13 @@ import argparse
 import time
 import math
 import os
+import sys
 import torch
 import torch.nn as nn
 import torch.onnx
 import torch.optim as optim
 import data
-import model
+import model_1
 import random
 import numpy as np
 
@@ -17,21 +18,24 @@ parser.add_argument('--data', type=str, default='./data',
                     help='location of the data corpus')
 parser.add_argument('--model', type=str, default='FNN',
                     help='type of recurrent net (FNN)')
-parser.add_argument('--embedding_size', type=int, default=100,
+parser.add_argument('--embedding_size', type=int, default=256,
                     help='size of word embeddings')
-parser.add_argument('--hidden_size', type=int, default=100,
+parser.add_argument('--hidden_size', type=int, default=256,
                     help='number of hidden units per layer')
-parser.add_argument('--lr', type=float, default=0.002,
+parser.add_argument('--lr', type=float, default=0.04,
+#parser.add_argument('--lr', type=float, default=0.001,
                     help='initial learning rate')
-parser.add_argument('--max_grad_norm', type=float, default=0.25,
+parser.add_argument('--momentum', type=float, default=0.95,
+                    help='initial momentum')
+parser.add_argument('--weight_decay', type=float, default=1e-8,
+                    help='weight_decay')
+parser.add_argument('--max_grad_norm', type=float, default=1.0,
                     help='gradient clipping')
-parser.add_argument('--epochs', type=int, default=4,
+parser.add_argument('--epochs', type=int, default=40,
                     help='upper epoch limit')
-parser.add_argument('--batch_size', type=int, default=20, metavar='N',
+parser.add_argument('--batch_size', type=int, default=256, metavar='N',
                     help='batch size')
-parser.add_argument('--window_size', type=int, default=1,
-                    help='sequence length')
-parser.add_argument('--bptt', type=int, default=35,
+parser.add_argument('--window_size', type=int, default=13,
                     help='sequence length')
 parser.add_argument('--dropout', type=float, default=0.2,
                     help='dropout applied to layers (0 = no dropout)')
@@ -39,11 +43,11 @@ parser.add_argument('--tied', action='store_true',
                     help='tie the word embedding and softmax weights')
 parser.add_argument('--seed', type=int, default=1111,
                     help='random seed')
-parser.add_argument('--cuda', action='store_true',
+parser.add_argument('--cuda', action='store_false',
                     help='use CUDA')
 parser.add_argument('--log_interval', type=int, default=200, metavar='N',
                     help='report interval')
-parser.add_argument('--save', type=str, default='model.pt',
+parser.add_argument('--save', type=str, default='fnnmodel.pt',
                     help='path to save the final model')
 parser.add_argument('--onnx_export', type=str, default='',
                     help='path to export the final model in onnx format')
@@ -52,7 +56,7 @@ parser.add_argument('--dry_run', action='store_true',
                     help='verify the code and the model')
 
 args = parser.parse_args()
-
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -64,7 +68,8 @@ set_seed(args.seed)
 if torch.cuda.is_available():
     if not args.cuda:
         print("WARNING: You have a CUDA device, so you should probably run with --cuda")
-
+print(torch.cuda.device_count())
+#torch.cuda.set_device(7)
 device = torch.device("cuda" if args.cuda else "cpu")
 
 ###############################################################################
@@ -85,14 +90,14 @@ corpus = data.Corpus(args.data)
 # dependence of e. g. 'g' on 'f' can not be learned, but allows more efficient
 # batch processing.
 
-def batchify(data, batch_size):
+def batchify(data, bsz):
     # Work out how cleanly we can divide the dataset into bsz parts.
-    nbatch = data.size(0) // batch_size
+    nbatch = data.size(0) // bsz
     # Trim off any extra elements that wouldn't cleanly fit (remainders).
-    data = data.narrow(0, 0, nbatch * batch_size)
+    data = data.narrow(0, 0, nbatch * bsz)
     # Evenly divide the data across the bsz batches.
-    data = data.view(batch_size, -1).t().contiguous()
-    #data = data.view(bsz, -1)
+    #data = data.view(bsz, -1).t().contiguous()
+    data = data.view(bsz, -1)
     return data.to(device)
 
 eval_batch_size = 10
@@ -105,11 +110,13 @@ test_data = batchify(corpus.test, eval_batch_size)
 ###############################################################################
 
 ntokens = len(corpus.dictionary)
-model = model.FNNModel(args.model, ntokens, args.embedding_size, args.window_size, args.hidden_size, args.bptt, args.dropout, args.tied).to(device)
+model = model_1.FNNModel(args.model, ntokens, args.embedding_size, args.window_size, args.hidden_size, args.dropout, args.tied).to(device)
 
 criterion = nn.NLLLoss()
-optimizer = optim.Adam(model.parameters(), args.lr)
-
+#optimizer = optim.Adam(model.parameters(), args.lr)
+optimizer = optim.SGD(model.parameters(), args.lr, args.momentum)
+#optimizer = optim.SGD(model.parameters(), args.lr, args.momentum, args.weight_decay)
+#optimizer = optim.Adadelta(model.parameters())
 ###############################################################################
 # Training code
 ###############################################################################
@@ -134,9 +141,9 @@ def repackage_hidden(h):
 # to the seq_len dimension in the LSTM.
 
 def get_batch(source, i):
-    seq_len = min(args.bptt, len(source) - i - args.window_size)
-    data = source[i:i+seq_len+args.window_size-1]
-    target = source[i+args.window_size:i+seq_len+args.window_size].view(-1)
+    seq_len = min(args.window_size, source.size(1) - 1 - i)
+    data = source[:,i:i+seq_len]
+    target = source[:,i+seq_len:i+1+seq_len].view(-1)
     return data, target
 
 
@@ -146,15 +153,11 @@ def evaluate(data_source):
     total_loss = 0.
     ntokens = len(corpus.dictionary)
     with torch.no_grad():
-        for i in range(0, data_source.size(0) - 1, args.bptt):
-            #print(i)
+        for i in range(0, data_source.size(1) - args.window_size):
             data, targets = get_batch(data_source, i)
             output = model(data)
-            #print(criterion(output, targets).item())
-            total_loss += len(data) * criterion(output, targets).item()
-    #print(total_loss)
-    #print((len(data_source) - 1))
-    return total_loss /  (len(data_source) - 1)
+            total_loss += criterion(output, targets).item()
+    return total_loss / (data_source.size(1) - args.window_size)
 
 
 def train():
@@ -164,8 +167,7 @@ def train():
     total_loss = 0.
     start_time = time.time()
     ntokens = len(corpus.dictionary)
-    for batch, i in enumerate(range(0, train_data.size(0) - 1, args.bptt)):
-    #for batch, i in enumerate(range(0, train_data.size(1) - args.window_size)):
+    for batch, i in enumerate(range(0, train_data.size(1) - args.window_size)):
         data, targets = get_batch(train_data, i)
         #print(data.shape)
         #print(targets.shape)
@@ -188,8 +190,9 @@ def train():
             elapsed = time.time() - start_time
             print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:02.4f} | ms/batch {:5.2f} | '
                     'loss {:5.2f} | ppl {:8.2f}'.format(
-                epoch, batch, len(train_data) // args.bptt, lr,
+                epoch, batch, train_data.size(1) - 1 - args.window_size, lr,
                 elapsed * 1000 / args.log_interval, cur_loss, math.exp(cur_loss)))
+            sys.stdout.flush()
             total_loss = 0
             start_time = time.time()
         if args.dry_run:
@@ -213,15 +216,31 @@ try:
                 'valid ppl {:8.2f}'.format(epoch, (time.time() - epoch_start_time),
                                            val_loss, math.exp(val_loss)))
         print('-' * 89)
+        sys.stdout.flush()
         # Save the model if the validation loss is the best we've seen so far.
         if not best_val_loss or val_loss < best_val_loss:
             with open(args.save, 'wb') as f:
                 torch.save(model, f)
             best_val_loss = val_loss
+            print("good than previous best!!!!!!!!!!!!!!!!")
+            print("do one test!!!!!")
+            test_loss = evaluate(test_data)
+            print('=' * 89)
+            print('| End of training | test loss {:5.2f} | test ppl {:8.2f}'.format(test_loss, math.exp(test_loss)))
+            print('=' * 89)
+            sys.stdout.flush()
         else:
-            print("not good than previous best")
+            print("not good than previous best..........")
+            print("still do one test!!!!!")
+            test_loss = evaluate(test_data)
+            print('=' * 89)
+            print('| End of training | test loss {:5.2f} | test ppl {:8.2f}'.format(test_loss, math.exp(test_loss)))
+            print('=' * 89)
+            sys.stdout.flush()
             # Anneal the learning rate if no improvement has been seen in the validation dataset.
             #lr /= 4.0
+            for p in optimizer.param_groups:
+                p['lr'] *= 0.50
 except KeyboardInterrupt:
     print('-' * 89)
     print('Exiting from training early')
@@ -241,7 +260,7 @@ print('=' * 89)
 print('| End of training | test loss {:5.2f} | test ppl {:8.2f}'.format(
     test_loss, math.exp(test_loss)))
 print('=' * 89)
-
+sys.stdout.flush()
 
 def export_onnx(path, batch_size, seq_len):
     print('The model is also exported in ONNX format at {}'.
